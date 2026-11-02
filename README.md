@@ -25,7 +25,7 @@ guess it offline.
 
 | Piece | Where | Role |
 |---|---|---|
-| vault | `/var/lib/safe-lock/vault.img` (root-only) | LUKS2 + ext4, 256 MB |
+| vault | `/var/lib/safe-lock/vault.img` (root-only) | LUKS2 + ext4, 64 MB (change with `resize.sh`) |
 | key slots | inside the vault header | slot 0 recovery key, slot 1 TPM2 + PIN (no PCRs) |
 | [root/safe-helper](root/safe-helper) | `/usr/local/libexec/safe-lock/safe-helper` | root side: attach/mount, unmount/detach |
 | [root/org.safelock.policy](root/org.safelock.policy), [root/50-safe-lock.rules](root/50-safe-lock.rules) | polkit | lets you (only) run the helper without an admin password |
@@ -52,7 +52,8 @@ sudo ./install.sh --backup-dir /media/max/SSD-2TB/safe-lock-backup   # root part
 ./install-user.sh        # icon, safe command, watcher (no sudo)
 ```
 
-`prototype.sh` is the throwaway TPM test used before the first install.
+`prototype.sh` (TPM + PIN) and `test-resize.sh` (resizing) are throwaway
+tests on dummy vaults; neither touches the real one.
 
 ## If the TPM is lost (keep this section reachable without the Safe)
 
@@ -118,9 +119,10 @@ at hand. It also breaks BitLocker on the Windows side if that's enabled.
 After every lock, the vault file (still encrypted) is copied to
 `SAFE_BACKUP_DIR` from `/etc/safe-lock.conf`, which here is
 `/media/max/SSD-2TB/safe-lock-backup`. The last three copies are kept:
-`vault.img`, `vault.img.1` and `vault.img.2`. A copy is useless without the
-recovery key, so it doesn't matter that the NTFS drive can't restrict who
-reads it.
+`vault.img`, `vault.img.1` and `vault.img.2`. The copies are sparse, so the
+vault's never-used space takes no room on the drive. A copy is useless
+without the recovery key, so it doesn't matter that the NTFS drive can't
+restrict who reads it.
 
 - The backup is skipped, with a warning, if the folder is on the vault's own
   disk. That also catches the SSD not being mounted.
@@ -131,17 +133,22 @@ reads it.
   `vault.img` somewhere else (cloud, USB stick). That's safe for the same
   reason.
 
-## Making it bigger
+## Changing the size
+
+The PIN and recovery key stay as they are, because they live in the header,
+which a resize doesn't touch. Lock the Safe first; the script asks for your
+PIN and refuses a size that's too small before changing anything.
 
 ```bash
-safe lock && sudo truncate -s +256M /var/lib/safe-lock/vault.img
+sudo ./resize.sh fit       # smallest size that leaves 16 MB free for new files
 ```
-
-Then open the Safe and grow the filesystem:
 
 ```bash
-sudo resize2fs /dev/mapper/safe-lock
+sudo ./resize.sh 512M      # any size, bigger or smaller
 ```
+
+It keeps a copy of the old vault until the resized one has been reopened and
+checked. `test-resize.sh` runs the same steps on a throwaway vault.
 
 ## Limits (what this does not protect)
 

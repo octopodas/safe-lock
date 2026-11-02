@@ -233,7 +233,10 @@ do_backup() {
     mkdir -p -- "$dir" || return 1
     rm -f -- "$dir"/.vault.img.*
     tmp=$(mktemp "$dir/.vault.img.XXXXXX") || return 1
-    if pkexec "$HELPER" export > "$tmp" && cryptsetup isLuks "$tmp" 2>/dev/null; then
+    # Sparse copy: the never-written part of the vault is zeros and takes no space.
+    # shellcheck disable=SC2216  # cp reads the pipe via /dev/stdin
+    if pkexec "$HELPER" export | cp --sparse=always /dev/stdin "$tmp" \
+            && cryptsetup isLuks "$tmp" 2>/dev/null; then
         [[ -e $dir/vault.img.1 ]] && mv -f -- "$dir/vault.img.1" "$dir/vault.img.2"
         [[ -e $dir/vault.img ]] && mv -f -- "$dir/vault.img" "$dir/vault.img.1"
         mv -f -- "$tmp" "$dir/vault.img"
