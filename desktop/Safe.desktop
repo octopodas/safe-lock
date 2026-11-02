@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Name=Safe
+Comment=TPM-bound encrypted vault. Double-click to open, drop files on it to lock them away.
+Icon=folder-locked
+Exec=__HOME__/.local/bin/safe drop %F
+Terminal=false
+Categories=Utility;Security;
+Actions=open;lock;
+
+[Desktop Action open]
+Name=Open Safe
+Icon=folder-unlocked
+Exec=__HOME__/.local/bin/safe open
+
+[Desktop Action lock]
+Name=Lock now
+Icon=folder-locked
+Exec=__HOME__/.local/bin/safe lock

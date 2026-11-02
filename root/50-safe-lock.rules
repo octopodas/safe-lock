@@ -1,0 +1,8 @@
+// Let the Safe's owner run safe-helper without an admin password, including
+// from the auto-lock timer (a user service, outside the desktop session).
+// The TPM PIN is what actually guards unlocking.
+polkit.addRule(function (action, subject) {
+    if (action.id == "org.safelock.helper" && subject.user == "__USER__") {
+        return polkit.Result.YES;
+    }
+});

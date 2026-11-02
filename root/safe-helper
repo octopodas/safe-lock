@@ -1,0 +1,86 @@
+#!/bin/bash
+# safe-helper — the root half of the Safe. Installed root-owned at
+# /usr/local/libexec/safe-lock/safe-helper and run via pkexec by the Safe's
+# owner (polkit action org.safelock.helper). It only ever touches the paths
+# in /etc/safe-lock.conf, never anything passed in by the caller.
+#
+#   safe-helper status   -> prints locked | unlocked
+#   safe-helper unlock   -> reads the PIN from stdin (one line)
+#   safe-helper lock     -> unmount + close; exit 2 if files are still in use
+#
+# Exit codes: 0 ok, 1 error, 2 busy, 3 wrong PIN / unlock failed, 4 TPM lockout
+set -uo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+
+CONF=/etc/safe-lock.conf
+
+die() { echo "safe-helper: $*" >&2; exit "${2:-1}"; }
+
+[[ $EUID -eq 0 ]] || die "must run as root (via pkexec)"
+[[ $(stat -c '%u %a' "$CONF" 2>/dev/null) == "0 644" ]] || die "$CONF missing or not root-owned 0644"
+# shellcheck source=/dev/null
+source "$CONF"
+: "${SAFE_UID:?}" "${SAFE_IMAGE:?}" "${SAFE_MAPPER:?}" "${SAFE_MOUNT:?}"
+
+# Under pkexec only the configured owner may drive the Safe.
+if [[ -n ${PKEXEC_UID:-} && $PKEXEC_UID != "$SAFE_UID" ]]; then
+    die "uid $PKEXEC_UID is not the Safe owner"
+fi
+
+is_mounted() { findmnt -rn --mountpoint "$SAFE_MOUNT" >/dev/null 2>&1; }
+is_open()    { [[ -e /dev/mapper/$SAFE_MAPPER ]]; }
+
+do_status() {
+    if is_mounted; then echo unlocked; else echo locked; fi
+}
+
+do_unlock() {
+    is_mounted && return 0
+
+    local pin
+    IFS= read -r -n 256 pin || true
+
+    if ! is_open; then
+        [[ -n $pin ]] || die "no PIN given" 3
+        local err
+        err=$(PIN="$pin" systemd-cryptsetup attach "$SAFE_MAPPER" "$SAFE_IMAGE" - \
+                tpm2-device=auto,headless=true 2>&1 >/dev/null)
+        local rc=$?
+        pin=
+        if (( rc != 0 )); then
+            echo "$err" >&2
+            if grep -qiE 'lockout|DA_LOCKOUT|dictionary' <<<"$err"; then exit 4; fi
+            exit 3
+        fi
+    fi
+    pin=
+
+    e2fsck -p "/dev/mapper/$SAFE_MAPPER" >/dev/null 2>&1
+    (( $? < 4 )) || die "filesystem check failed; run: sudo e2fsck /dev/mapper/$SAFE_MAPPER"
+
+    install -d -m 0755 -o root -g root "$(dirname "$SAFE_MOUNT")"
+    install -d -m 0755 -o root -g root "$SAFE_MOUNT"
+    mount -t ext4 -o nosuid,nodev,noexec,noatime "/dev/mapper/$SAFE_MAPPER" "$SAFE_MOUNT" \
+        || die "mount failed"
+}
+
+do_lock() {
+    if is_mounted; then
+        if ! umount "$SAFE_MOUNT" 2>/dev/null; then
+            echo "in use by:" >&2
+            fuser -vm "$SAFE_MOUNT" 2>&1 | awk 'NR>1 {print "  " $NF " (pid " $(NF-2) ")"}' >&2
+            exit 2
+        fi
+    fi
+    if is_open; then
+        systemd-cryptsetup detach "$SAFE_MAPPER" || die "could not close the vault device"
+    fi
+}
+
+case ${1:-} in
+    status) do_status ;;
+    unlock) do_unlock ;;
+    lock)   do_lock ;;
+    *)      die "usage: safe-helper status|unlock|lock" ;;
+esac

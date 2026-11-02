@@ -1,0 +1,12 @@
+[Unit]
+Description=Lock the Safe when the screen locks or the PC goes to sleep
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/safe watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

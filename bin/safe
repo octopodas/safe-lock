@@ -1,0 +1,236 @@
+#!/bin/bash
+# safe — the user half of the Safe: a LUKS2 vault bound to this PC's TPM + a PIN.
+#
+#   safe                 unlock if needed and open the Safe in the file manager
+#   safe add FILE...     move files into the Safe (unlock if needed), wipe originals
+#   safe drop [FILE...]  what the Desktop icon runs: add if given files, else open
+#   safe lock            lock now
+#   safe status          print locked / unlocked
+#   safe watch           (run by safe-watch.service) lock on screen lock / sleep
+#
+# Root work goes through /usr/local/libexec/safe-lock/safe-helper via pkexec.
+set -uo pipefail
+
+HELPER=/usr/local/libexec/safe-lock/safe-helper
+CONF=/etc/safe-lock.conf
+SELF=$(realpath "$0")
+SAFE_LINK=$HOME/Safe
+DESKTOP_FILE=$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")/Safe.desktop
+AUTOLOCK=${SAFE_AUTOLOCK:-15min}
+WINDOW_PIDS=${XDG_RUNTIME_DIR:-/tmp}/safe-dolphin.pids
+
+[[ -r $CONF ]] || { echo "safe: $CONF not found; run install.sh first" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$CONF"
+MOUNT=$SAFE_MOUNT
+
+notify() { notify-send -a Safe -i "${3:-folder-locked}" "$1" "${2:-}" 2>/dev/null || true; }
+
+is_unlocked() { findmnt -rn --mountpoint "$MOUNT" >/dev/null 2>&1; }
+
+set_icon() {
+    # Only the first Icon= line; the right-click actions keep their own icons.
+    [[ -f $DESKTOP_FILE ]] && sed -i "0,/^Icon=/s/^Icon=.*/Icon=$1/" "$DESKTOP_FILE"
+}
+
+schedule_autolock() {
+    systemctl --user stop safe-autolock.timer safe-autolock.service 2>/dev/null
+    systemctl --user reset-failed safe-autolock.timer safe-autolock.service 2>/dev/null
+    systemd-run --user --quiet --unit=safe-autolock --on-active="$1" \
+        --timer-property=AccuracySec=5s "$SELF" lock --auto
+}
+
+cancel_autolock() {
+    systemctl --user stop safe-autolock.timer 2>/dev/null
+    systemctl --user reset-failed safe-autolock.timer safe-autolock.service 2>/dev/null
+}
+
+after_unlock() {
+    if [[ ! -e $SAFE_LINK || -L $SAFE_LINK ]]; then
+        ln -sfn "$MOUNT" "$SAFE_LINK"
+    fi
+    # No thumbnails/previews for anything in here.
+    [[ -e $MOUNT/.directory ]] || printf '[Dolphin]\nPreviewsShown=false\nVersion=4\n' > "$MOUNT/.directory"
+    set_icon folder-unlocked
+    schedule_autolock "$AUTOLOCK"
+}
+
+ensure_unlocked() {
+    if is_unlocked; then
+        schedule_autolock "$AUTOLOCK"
+        return 0
+    fi
+
+    local pin out rc prompt="Enter your Safe PIN:"
+    for _ in 1 2 3; do
+        pin=$(kdialog --title Safe --password "$prompt") || return 1
+        out=$(printf '%s\n' "$pin" | pkexec "$HELPER" unlock 2>&1)
+        rc=$?
+        pin=
+        case $rc in
+            0) after_unlock; return 0 ;;
+            3) prompt="Wrong PIN, try again:" ;;
+            4) kdialog --title Safe --error "The TPM is in lockout after too many wrong PINs.
+Wait for it to cool down, or unlock with your recovery key:
+  sudo systemd-cryptsetup attach $SAFE_MAPPER $SAFE_IMAGE"
+               return 1 ;;
+            126|127) return 1 ;;   # polkit dialog dismissed / not authorized
+            *) kdialog --title Safe --error "Could not unlock the Safe:
+$out"
+               return 1 ;;
+        esac
+    done
+    kdialog --title Safe --sorry "Three wrong PINs. The TPM counts every miss; take a break before trying again.
+
+Last error:
+$out"
+    return 1
+}
+
+do_open() {
+    ensure_unlocked || return 1
+    if command -v dolphin >/dev/null; then
+        # A Dolphin process of its own, so locking can close it without
+        # touching your other Dolphin windows.
+        dolphin --new-window "$SAFE_LINK/" >/dev/null 2>&1 &
+        echo $! >> "$WINDOW_PIDS"
+        disown
+    else
+        xdg-open "$SAFE_LINK/" >/dev/null 2>&1 &
+    fi
+}
+
+# Close the Safe's own Dolphin windows, plus any other Dolphin or KIO worker
+# that still has something inside the Safe open.
+close_safe_windows() {
+    local pid comm pids=() holders=() killed=()
+    [[ -f $WINDOW_PIDS ]] && mapfile -t pids < "$WINDOW_PIDS"
+    rm -f -- "$WINDOW_PIDS"
+    is_unlocked && read -ra holders <<<"$(fuser -m "$MOUNT" 2>/dev/null)" && pids+=("${holders[@]}")
+
+    for pid in "${pids[@]}"; do
+        comm=$(ps -o comm= -p "$pid" 2>/dev/null) || continue
+        case $comm in
+            dolphin|kioslave5|kioworker) kill "$pid" 2>/dev/null && killed+=("$pid") ;;
+        esac
+    done
+
+    local _
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        (( ${#killed[@]} )) || break
+        ps -p "$(IFS=,; echo "${killed[*]}")" >/dev/null 2>&1 || break
+        sleep 0.3
+    done
+}
+
+unique_dest() {
+    local name=$1 stem ext n=2 dest="$MOUNT/$1"
+    if [[ $name == ?*.* ]]; then stem=${name%.*}; ext=.${name##*.}; else stem=$name; ext=; fi
+    while [[ -e $dest || -L $dest ]]; do
+        dest="$MOUNT/$stem ($n)$ext"
+        n=$((n + 1))
+    done
+    printf '%s' "$dest"
+}
+
+# Copy one item in, verify the copy, then wipe the original.
+add_one() {
+    local src=$1 real dest
+    src=${src#file://}
+    if [[ -L $src ]]; then echo "skipped (symlink): $src"; return 1; fi
+    if [[ ! -e $src ]]; then echo "skipped (missing): $src"; return 1; fi
+    real=$(realpath -- "$src")
+    case $real/ in
+        "$MOUNT"/*) echo "skipped (already in the Safe): $src"; return 1 ;;
+    esac
+
+    dest=$(unique_dest "$(basename -- "$real")")
+    if [[ -d $real ]]; then
+        cp -R --preserve=timestamps -- "$real" "$dest" && diff -rq -- "$real" "$dest" >/dev/null || {
+            rm -rf -- "$dest"; echo "failed to copy: $src"; return 1; }
+        find "$real" -type f -exec shred -u -- {} +
+        rm -rf -- "$real"
+    else
+        cp --preserve=timestamps -- "$real" "$dest" && cmp -s -- "$real" "$dest" || {
+            rm -f -- "$dest"; echo "failed to copy: $src"; return 1; }
+        shred -u -- "$real"
+    fi
+    echo "added: $(basename -- "$dest")"
+}
+
+do_add() {
+    (( $# )) || { echo "usage: safe add FILE..." >&2; return 1; }
+    ensure_unlocked || return 1
+    local f ok=0 bad=0 report=""
+    for f in "$@"; do
+        if line=$(add_one "$f"); then ok=$((ok + 1)); else bad=$((bad + 1)); fi
+        report+="$line"$'\n'
+    done
+    echo -n "$report"
+    if (( bad )); then
+        notify "Safe: $ok added, $bad skipped" "$report" dialog-warning
+    else
+        notify "Safe: $ok item(s) locked away" "Originals were wiped from their old location." folder-unlocked
+    fi
+}
+
+do_lock() {
+    local auto=0 out rc
+    [[ ${1:-} == --auto ]] && auto=1
+    (( auto )) || cancel_autolock
+
+    if ! is_unlocked && [[ ! -e /dev/mapper/$SAFE_MAPPER ]]; then
+        (( auto )) || echo "already locked"
+        return 0
+    fi
+
+    if (( auto )); then
+        # Keep retrying until whatever holds files open lets go. Opening the
+        # Safe again replaces this unit, which ends the loop.
+        local warned=0
+        until close_safe_windows; out=$(pkexec "$HELPER" lock 2>&1); do
+            if (( !warned )); then
+                notify "Safe could not auto-lock" "Close these and it will lock by itself:
+${out#in use by:$'\n'}" dialog-warning
+                warned=1
+            fi
+            sleep 30
+        done
+    else
+        close_safe_windows
+        out=$(pkexec "$HELPER" lock 2>&1)
+        rc=$?
+        if (( rc != 0 )); then
+            kdialog --title Safe --sorry "The Safe is still in use and was not locked.
+$out" 2>/dev/null || echo "$out" >&2
+            return "$rc"
+        fi
+    fi
+
+    [[ -L $SAFE_LINK ]] && rm -f -- "$SAFE_LINK"
+    set_icon folder-locked
+    notify "Safe locked"
+}
+
+do_watch() {
+    {
+        gdbus monitor --session --dest org.freedesktop.ScreenSaver &
+        gdbus monitor --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 &
+        wait
+    } | while IFS= read -r line; do
+        case $line in
+            *ScreenSaver.ActiveChanged\ \(true,\)*|*PrepareForSleep\ \(true,\)*)
+                is_unlocked && schedule_autolock 1s ;;
+        esac
+    done
+}
+
+case ${1:-open} in
+    open)   do_open ;;
+    add)    shift; do_add "$@" ;;
+    drop)   shift; if (( $# )); then do_add "$@"; else do_open; fi ;;
+    lock)   shift; do_lock "$@" ;;
+    status) if is_unlocked; then echo unlocked; else echo locked; fi ;;
+    watch)  do_watch ;;
+    *)      sed -n '2,11p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

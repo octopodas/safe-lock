@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Lets the logged-in user lock/unlock the Safe without an admin password.
+     The TPM PIN is the real gate; safe-helper itself checks PKEXEC_UID. -->
+<policyconfig>
+  <action id="org.safelock.helper">
+    <description>Lock or unlock the Safe</description>
+    <message>Authentication is required to lock or unlock the Safe</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/safe-lock/safe-helper</annotate>
+  </action>
+</policyconfig>
