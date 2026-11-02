@@ -4,11 +4,13 @@
 #   safe                 unlock if needed and open the Safe in the file manager
 #   safe add FILE...     move files into the Safe (unlock if needed), wipe originals
 #   safe drop [FILE...]  what the Desktop icon runs: add if given files, else open
-#   safe lock            lock now
+#   safe lock            lock now (then back up, if SAFE_BACKUP_DIR is set)
+#   safe backup          back up now (the Safe must be locked)
 #   safe status          print locked / unlocked
 #   safe watch           (run by safe-watch.service) lock on screen lock / sleep
 #
 # Root work goes through /usr/local/libexec/safe-lock/safe-helper via pkexec.
+# Settings come from /etc/safe-lock.conf.
 set -uo pipefail
 
 HELPER=/usr/local/libexec/safe-lock/safe-helper
@@ -210,6 +212,36 @@ $out" 2>/dev/null || echo "$out" >&2
     [[ -L $SAFE_LINK ]] && rm -f -- "$SAFE_LINK"
     set_icon folder-locked
     notify "Safe locked"
+    do_backup || true
+}
+
+# Copy the locked vault file (still encrypted) to SAFE_BACKUP_DIR, keeping
+# the last three copies: vault.img, vault.img.1, vault.img.2.
+do_backup() {
+    local dir=${SAFE_BACKUP_DIR:-} parent tmp
+    [[ -n $dir ]] || return 0
+
+    # A backup on the vault's own disk is no backup. This also catches the
+    # backup drive not being mounted (its empty mount point sits on /).
+    parent=$dir
+    while [[ ! -d $parent ]]; do parent=$(dirname "$parent"); done
+    if [[ $(stat -c %d "$parent") == "$(stat -c %d "$(dirname "$SAFE_IMAGE")")" ]]; then
+        notify "Safe backup skipped" "$dir is on the same disk as the vault. Is the backup drive mounted?" dialog-warning
+        return 1
+    fi
+
+    mkdir -p -- "$dir" || return 1
+    rm -f -- "$dir"/.vault.img.*
+    tmp=$(mktemp "$dir/.vault.img.XXXXXX") || return 1
+    if pkexec "$HELPER" export > "$tmp" && cryptsetup isLuks "$tmp" 2>/dev/null; then
+        [[ -e $dir/vault.img.1 ]] && mv -f -- "$dir/vault.img.1" "$dir/vault.img.2"
+        [[ -e $dir/vault.img ]] && mv -f -- "$dir/vault.img" "$dir/vault.img.1"
+        mv -f -- "$tmp" "$dir/vault.img"
+    else
+        rm -f -- "$tmp"
+        notify "Safe backup failed" "Could not copy the vault to $dir." dialog-warning
+        return 1
+    fi
 }
 
 do_watch() {
@@ -230,7 +262,10 @@ case ${1:-open} in
     add)    shift; do_add "$@" ;;
     drop)   shift; if (( $# )); then do_add "$@"; else do_open; fi ;;
     lock)   shift; do_lock "$@" ;;
+    backup) if is_unlocked; then echo "Lock the Safe first (it backs up on every lock)." >&2; exit 2; fi
+            [[ -n ${SAFE_BACKUP_DIR:-} ]] || { echo "No SAFE_BACKUP_DIR in $CONF; see install.sh --backup-dir" >&2; exit 1; }
+            do_backup && echo "backed up to $SAFE_BACKUP_DIR" ;;
     status) if is_unlocked; then echo unlocked; else echo locked; fi ;;
     watch)  do_watch ;;
-    *)      sed -n '2,11p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *)      sed -n '2,13p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

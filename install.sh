@@ -1,7 +1,11 @@
 #!/bin/bash
-# install.sh — root half of the Safe setup. Run once: sudo ./install.sh [SIZE]
-#   SIZE defaults to 256M. Re-running upgrades the helper and leaves an
-#   existing vault untouched.
+# install.sh — root half of the Safe setup.
+#   sudo ./install.sh [--backup-dir DIR | --no-backup] [SIZE]
+#
+#   SIZE defaults to 256M. Re-running upgrades the helper and config and
+#   leaves an existing vault untouched. --backup-dir sets where the locked
+#   vault is copied after every lock (must be on another disk); without the
+#   flag a re-run keeps the previous setting.
 #
 # Creates /var/lib/safe-lock/vault.img (LUKS2) with two ways in:
 #   1. this PC's TPM2 chip + your PIN (no PCR binding, so firmware/Windows
@@ -15,6 +19,20 @@ if [[ $EUID -ne 0 || -z ${SUDO_USER:-} || $SUDO_USER == root ]]; then
 fi
 
 here=$(cd "$(dirname "$0")" && pwd)
+
+backup_dir=__keep__
+while [[ ${1:-} == --* ]]; do
+    case $1 in
+        --backup-dir) backup_dir=${2:?--backup-dir needs a folder}; shift 2 ;;
+        --no-backup)  backup_dir=; shift ;;
+        *)            echo "unknown option: $1"; exit 1 ;;
+    esac
+done
+if [[ $backup_dir == __keep__ ]]; then
+    # shellcheck source=/dev/null
+    backup_dir=$( [[ -r /etc/safe-lock.conf ]] && source /etc/safe-lock.conf; echo "${SAFE_BACKUP_DIR:-}" )
+fi
+
 size=${1:-256M}
 user=$SUDO_USER
 uid=$(id -u "$user")
@@ -45,8 +63,10 @@ SAFE_UID=$uid
 SAFE_IMAGE=$IMAGE
 SAFE_MAPPER=$MAPPER
 SAFE_MOUNT=$MOUNT
+SAFE_BACKUP_DIR=$(printf '%q' "$backup_dir")
 EOF
 chmod 0644 /etc/safe-lock.conf
+log "backups after every lock: ${backup_dir:-off}"
 
 if [[ -e $IMAGE ]]; then
     log "== vault already exists at $IMAGE, leaving it untouched"

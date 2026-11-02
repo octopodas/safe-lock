@@ -7,6 +7,8 @@
 #   safe-helper status   -> prints locked | unlocked
 #   safe-helper unlock   -> reads the PIN from stdin (one line)
 #   safe-helper lock     -> unmount + close; exit 2 if files are still in use
+#   safe-helper export   -> writes the vault file (still encrypted) to stdout,
+#                           only while locked; used for backups
 #
 # Exit codes: 0 ok, 1 error, 2 busy, 3 wrong PIN / unlock failed, 4 TPM lockout
 set -uo pipefail
@@ -31,11 +33,20 @@ fi
 is_mounted() { findmnt -rn --mountpoint "$SAFE_MOUNT" >/dev/null 2>&1; }
 is_open()    { [[ -e /dev/mapper/$SAFE_MAPPER ]]; }
 
+# Unlock and export exclude each other, so a backup never copies the file
+# while it is being written to.
+take_lock() {
+    install -d -m 0755 -o root -g root "$(dirname "$SAFE_MOUNT")"
+    exec 9>"$(dirname "$SAFE_MOUNT")/.busy"
+    flock 9
+}
+
 do_status() {
     if is_mounted; then echo unlocked; else echo locked; fi
 }
 
 do_unlock() {
+    take_lock
     is_mounted && return 0
 
     local pin
@@ -78,9 +89,16 @@ do_lock() {
     fi
 }
 
+do_export() {
+    take_lock
+    is_open && die "the Safe is unlocked; lock it first" 2
+    exec cat "$SAFE_IMAGE"
+}
+
 case ${1:-} in
     status) do_status ;;
     unlock) do_unlock ;;
     lock)   do_lock ;;
-    *)      die "usage: safe-helper status|unlock|lock" ;;
+    export) do_export ;;
+    *)      die "usage: safe-helper status|unlock|lock|export" ;;
 esac
